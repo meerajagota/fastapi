@@ -14,8 +14,15 @@ for i in $(seq 1 $num_cores); do
     device_num=$(($core_num/4))
 
     docker run -t -d \
-	    --name ${docker_container_name}'-nc'${core_num} \
-	    --env NEURON_RT_VISIBLE_CORES="${core_num}-${core_num}" \
-	    --env CHIP_TYPE=${CHIP_TYPE} \
-	    -p ${port_num}:8080 --device=/dev/neuron${device_num} ${registry}/${docker_image_name}
+    --name ${docker_container_name}'-nc'${core_num} \
+    --env NEURON_RT_VISIBLE_CORES="0-1" \
+    --env CHIP_TYPE=${CHIP_TYPE} \
+    -p ${port_num}:8080 --device=/dev/neuron0  ${registry}/${docker_image_name}
+
+
+    # docker run -t -d \
+	#     --name ${docker_container_name}'-nc'${core_num} \
+	#     --env NEURON_RT_VISIBLE_CORES="${core_num}-${core_num}" \
+	#     --env CHIP_TYPE=${CHIP_TYPE} \
+	#     -p ${port_num}:8080 --device=/dev/neuron${device_num} ${registry}/${docker_image_name}
 done
