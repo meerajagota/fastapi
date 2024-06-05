@@ -1,10 +1,13 @@
-from typing import Optional
+from typing import Optional, List, Dict
 from fastapi import FastAPI, responses
 from configparser import ConfigParser
 import torch
 import logging
 import importlib
 import os
+
+from huggingface_hub import login
+login(token="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")
 
 global device
 global processor
@@ -13,11 +16,14 @@ global tokenizers
 global logger
 global default_question, default_context
 
-chip_type = os.environ.get("CHIP_TYPE", "inf1")
-if chip_type == "inf1":
-    import torch_neuron
-elif chip_type == "inf2":
-    import torch_neuronx
+
+import torch_neuronx
+import torch
+from transformers import AutoTokenizer
+from transformers_neuronx import constants
+from transformers_neuronx.config import NeuronConfig
+from transformers_neuronx.mistral.model import MistralForSampling
+
 
 logger = logging.getLogger()
 
@@ -30,23 +36,11 @@ with open('config.properties') as f:
 config = ConfigParser()
 config.read_string(config_lines)
 
-compiled_model = config['global']['compiled_model']
 num_models_per_server = int(config['global']['num_models_per_server'])
-
-model_name = 'twmkn9/bert-base-uncased-squad2'
-tokenizer_class_name = 'AutoTokenizer'
-model_class_name = 'AutoModelForQuestionAnswering'
-transformers = importlib.import_module("transformers")
-tokenizer_class = getattr(transformers, tokenizer_class_name)
-
-default_question = "What does the little engine say"
-default_context = """In the childrens story about the little engine a small locomotive is pulling a large load up a mountain.
-    Since the load is heavy and the engine is small it is not sure whether it will be able to do the job. This is a story 
-    about how an optimistic attitude empowers everyone to achieve more. In the story the little engine says: 'I think I can' as it is 
-    pulling the heavy load all the way to the top of the mountain. On the way down it says: I thought I could."""
 
 env_var = os.getenv('NEURON_RT_VISIBLE_CORES')
 neuron_core = int(env_var[0])
+print(neuron_core)
 
 # FastAPI server
 app = FastAPI()
@@ -63,53 +57,53 @@ postprocess = True
 quiet = False
 
 
+global tokenizer
+tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.1")
+
+
+global model
+model = MistralForSampling.from_pretrained(
+           "mistralai/Mistral-7B-Instruct-v0.1",
+            batch_size=1,
+            tp_degree=2,
+            n_positions=8000,
+            amp="bf16",
+            context_length_estimate=8000
+            )
+            # Load the compiled Neuron artifacts
+model.load("model.pt")
+model.to_neuron()
+
+
 # Model inference API endpoint
-@app.get("/{prediction_api_name}/{model_id}")
-async def infer(model_id, seq_0: Optional[str] = default_question, seq_1: Optional[str] = default_context):
-    question = seq_0
-    context = seq_1
+@app.post("/{prediction_api_name}/{model_id}")
+async def infer(model_id, prompt):
+    print(model_id)
+    # print(messages)
     status = 200
-    if model_id in models.keys():
+    messages = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "Do you have any recipes for the mayo you're talking about?"},
+            ]
+    
+    
+    encodeds = tokenizer.apply_chat_template(
+                messages, return_tensors="pt"
+            )
+    del messages
+    
+    # Use torch.inference_mode() as a context manager to optimize memory usage
+    with torch.inference_mode():
+        # Perform inference
+        with torch.no_grad():
+            output = model.sample(encodeds, sequence_length=6000, start_ids=None)
+            print([tokenizer.decode(tok) for tok in output])
+            del encodeds
+            del output
 
-        if not quiet:
-            logger.warning(f"\nQuestion: {question}\n")
+    # Manually delete tensors to free up memory
+    
+    
 
-        tokenizer = tokenizers[model_id]
-        encoded_input = tokenizer.encode_plus(question, context, return_tensors='pt', max_length=128,
-                                              padding='max_length', truncation=True)
-        model = models[model_id]
-        model_input = (encoded_input['input_ids'], encoded_input['attention_mask'])
-        output = model(*model_input)  # This is specific to Inferentia
-        answer_text = str(output[0])
+    return responses.JSONResponse(status_code=status, content={"detail": ""})
 
-        if postprocess:
-            answer_start = torch.argmax(output[0])
-            answer_end = torch.argmax(output[1]) + 1
-            if (answer_end > answer_start):
-                answer_text = tokenizer.convert_tokens_to_string(
-                    tokenizer.convert_ids_to_tokens(encoded_input["input_ids"][0][answer_start:answer_end]))
-            else:
-                answer_text = tokenizer.convert_tokens_to_string(
-                    tokenizer.convert_ids_to_tokens(encoded_input["input_ids"][0][answer_start:]))
-        if not quiet:
-            logger.warning("\nAnswer: ")
-            logger.warning(answer_text)
-    else:
-        status = 404
-        answer_text = f"Model {model_id} does not exist. Try a model name up to model{num_models - 1}"
-        if not quiet:
-            logger.warning(answer_text)
-    return responses.JSONResponse(status_code=status, content={"detail": answer_text})
-
-
-tokenizers = {}
-models = {}
-# LOAD Models
-print('Num of models to be loaded = ' + str(num_models_per_server))
-
-for i in range(num_models_per_server):
-    model_id = f'model_{i}'
-    # Load the compiled models
-    print(f'Loading Model {i} ....')
-    models[model_id] = torch.jit.load(f'/app/server/traced-models/{compiled_model}')
-    tokenizers[model_id] = tokenizer_class.from_pretrained(model_name)
